@@ -1,0 +1,3 @@
+<resources>
+    <string name="playback_time" formatted="true">%1$s / %2$s</string>
+</resources>
