@@ -6,11 +6,15 @@ Grabadora nativa con transcripción local en español mediante Nemotron Labs Uni
 
 1. Instala la APK en un dispositivo ARM64 con Android 8.0 o posterior.
 2. Abre **Recursos** y pulsa **Descargar modelo**. La descarga inicial requiere internet y ocupa aproximadamente 672 MB. Puedes grabar antes de descargarlo.
-3. Pulsa **Grabar con micrófono** y concede el permiso de Android. Si sales de la app, se detiene y guarda la grabación.
-4. Pulsa **Detener y guardar**. La transcripción empieza automáticamente si el modelo está instalado.
-5. Pulsa una grabación en la lista, ordenada de la más reciente a la más antigua. En su pantalla puedes reproducir el audio, saltar a otro momento, transcribir pendientes o copiar el texto.
+3. Pulsa **Grabar con micrófono** y concede el permiso de micrófono. En la pantalla de grabación puedes ver el tiempo y el nivel del micrófono, pausar y reanudar. Si la app pasa a segundo plano, se detiene y guarda la grabación.
+4. Pulsa **Guardar** para abrir el detalle. La transcripción empieza automáticamente si el modelo está instalado.
+5. Busca una grabación en la biblioteca, ordenada de la más reciente a la más antigua. En el detalle puedes escuchar el audio, saltar a otro momento, copiar la transcripción o eliminar ambos archivos.
+6. Para importar un audio, usa **Importar audio** en la biblioteca o elige **TransCrypting** en el menú **Compartir** de Android.
+7. Para personalizar el color de acento, abre **Tema** desde la biblioteca.
 
-La app guarda el audio WAV y las transcripciones en su almacenamiento privado. Después de descargar el modelo funciona sin conexión. Esta versión usa CPU y genera el texto al terminar la grabación.
+La app guarda el audio WAV y las transcripciones en su almacenamiento privado. Después de descargar el modelo puedes grabar y transcribir sin conexión. Esta versión usa CPU y genera el texto al terminar la grabación.
+
+Para hacer preguntas sobre una grabación, guarda tu clave de DeepSeek en **Recursos** y pulsa **Preguntar a DeepSeek** en el detalle de una grabación transcrita. El chat usa DeepSeek Flash y requiere internet. Al enviar una pregunta, se comparte el texto de la transcripción y el historial de ese chat con DeepSeek.
 
 Al terminar, la pantalla muestra la duración del audio, el tiempo total de transcripción y cuánto de ese tiempo tomó cargar Nemotron. Usa **Repetir** en una grabación para volver a medir con el mismo audio.
 

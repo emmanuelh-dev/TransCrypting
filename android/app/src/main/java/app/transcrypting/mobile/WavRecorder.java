@@ -4,6 +4,7 @@ import android.annotation.SuppressLint;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
+import android.os.SystemClock;
 
 import java.io.File;
 import java.io.IOException;
@@ -12,6 +13,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
+import java.util.function.IntConsumer;
 
 final class WavRecorder {
     static final int SAMPLE_RATE = 16_000;
@@ -19,13 +21,24 @@ final class WavRecorder {
     private static final long MAX_PCM_BYTES = 0xffff_ffffL - HEADER_BYTES;
 
     private volatile boolean stop;
+    private volatile boolean paused;
 
-    void stop() {
+    synchronized void stop() {
         stop = true;
+        notifyAll();
+    }
+
+    synchronized void setPaused(boolean paused) {
+        this.paused = paused;
+        notifyAll();
+    }
+
+    private synchronized void waitForResume() throws InterruptedException {
+        while (paused && !stop) wait();
     }
 
     @SuppressLint("MissingPermission")
-    void record(File destination, Runnable onStart) throws IOException {
+    void record(File destination, Runnable onStart, IntConsumer onLevel) throws IOException {
         int channels = AudioFormat.CHANNEL_IN_MONO;
         int format = AudioFormat.ENCODING_PCM_16BIT;
         int minBuffer = AudioRecord.getMinBufferSize(SAMPLE_RATE, channels, format);
@@ -48,7 +61,20 @@ final class WavRecorder {
                 onStart.run();
                 short[] samples = new short[1_600];
                 ByteBuffer pcm = ByteBuffer.allocate(samples.length * 2).order(ByteOrder.LITTLE_ENDIAN);
+                long lastLevel = 0;
                 while (!stop && !Thread.currentThread().isInterrupted() && bytes + pcm.capacity() <= MAX_PCM_BYTES) {
+                    if (paused) {
+                        recorder.stop();
+                        try {
+                            waitForResume();
+                        } catch (InterruptedException error) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                        if (stop) break;
+                        recorder.startRecording();
+                        if (recorder.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) break;
+                    }
                     int count = recorder.read(samples, 0, samples.length, AudioRecord.READ_BLOCKING);
                     if (count < 0) {
                         if (bytes > 0) break;
@@ -58,6 +84,13 @@ final class WavRecorder {
                     pcm.asShortBuffer().put(samples, 0, count);
                     output.write(pcm.array(), 0, count * 2);
                     bytes += count * 2L;
+                    long now = SystemClock.elapsedRealtime();
+                    if (now - lastLevel >= 90) {
+                        int peak = 0;
+                        for (int i = 0; i < count; i++) peak = Math.max(peak, Math.abs((int) samples[i]));
+                        onLevel.accept(peak);
+                        lastLevel = now;
+                    }
                 }
                 if (bytes == 0) throw new IOException("No se capturó audio.");
                 output.seek(0);
