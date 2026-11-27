@@ -1,5 +1,7 @@
 package app.transcrypting.mobile;
 
+import android.os.SystemClock;
+
 import com.k2fsa.sherpa.onnx.OfflineRecognizer;
 import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig;
 import com.k2fsa.sherpa.onnx.OfflineStream;
@@ -24,6 +26,8 @@ final class Nemotron {
     interface Progress {
         void update(int percent);
     }
+
+    record Transcription(String text, double audioSeconds, long modelLoadMs) {}
 
     private static final String MODEL_URL =
             "https://huggingface.co/pisar/nemotron-unified-asr-0.6b-sherpa-onnx/resolve/"
@@ -186,18 +190,21 @@ final class Nemotron {
         return true;
     }
 
-    String transcribe(File wav, Progress progress) throws IOException {
+    Transcription transcribe(File wav, Progress progress) throws IOException {
         OfflineRecognizerConfig config = new OfflineRecognizerConfig();
         config.getFeatConfig().setFeatureDim(128);
         var model = config.getModelConfig();
         model.setModelType("nemo_transducer");
+        model.setProvider("cpu");
         model.setNumThreads(Math.min(4, Runtime.getRuntime().availableProcessors()));
         model.setTokens(new File(directory, "tokens.txt").getAbsolutePath());
         model.getTransducer().setEncoder(new File(directory, "encoder.onnx").getAbsolutePath());
         model.getTransducer().setDecoder(new File(directory, "decoder.onnx").getAbsolutePath());
         model.getTransducer().setJoiner(new File(directory, "joiner.onnx").getAbsolutePath());
 
+        long loadStarted = SystemClock.elapsedRealtime();
         OfflineRecognizer recognizer = new OfflineRecognizer(null, config);
+        long modelLoadMs = SystemClock.elapsedRealtime() - loadStarted;
         try (RandomAccessFile audio = new RandomAccessFile(wav, "r")) {
             StringBuilder text = new StringBuilder();
             long totalSamples = (audio.length() - WavRecorder.HEADER_BYTES) / 2;
@@ -229,7 +236,7 @@ final class Nemotron {
                 position += count;
                 progress.update((int) (position * 100 / totalSamples));
             }
-            return text.toString();
+            return new Transcription(text.toString(), (double) totalSamples / WavRecorder.SAMPLE_RATE, modelLoadMs);
         } finally {
             recognizer.release();
         }

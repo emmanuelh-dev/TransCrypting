@@ -12,6 +12,8 @@ Grabadora nativa con transcripción local en español mediante Nemotron Labs Uni
 
 La app guarda el audio WAV y las transcripciones en su almacenamiento privado. Después de descargar el modelo funciona sin conexión. Esta versión usa CPU y genera el texto al terminar la grabación.
 
+Al terminar, la pantalla muestra la duración del audio, el tiempo total de transcripción y cuánto de ese tiempo tomó cargar Nemotron. Usa **Repetir** en una grabación para volver a medir con el mismo audio.
+
 ## Compilar
 
 Se requiere Java 17 y Android SDK 36. Desde esta carpeta:

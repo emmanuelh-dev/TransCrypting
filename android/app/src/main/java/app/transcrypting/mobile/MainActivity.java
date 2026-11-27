@@ -34,6 +34,7 @@ import java.text.DateFormat;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Date;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -261,17 +262,21 @@ public final class MainActivity extends Activity {
         worker.execute(() -> {
             long started = SystemClock.elapsedRealtime();
             try {
-                String text = model.transcribe(wav,
+                Nemotron.Transcription result = model.transcribe(wav,
                         percent -> post(() -> showProgress("Transcribiendo en el teléfono", percent)));
                 File destination = textFile(wav);
                 File temporary = new File(recordings, destination.getName() + ".part");
-                Files.write(temporary.toPath(), text.getBytes(StandardCharsets.UTF_8));
+                Files.write(temporary.toPath(), result.text().getBytes(StandardCharsets.UTF_8));
                 Files.move(temporary.toPath(), destination.toPath(),
                         StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-                android.util.Log.i("TransCrypting", "Nemotron transcribed " + (wav.length() - 44) / 32_000.0
-                        + "s of audio in " + (SystemClock.elapsedRealtime() - started) + "ms");
-                post(() -> finishOperation(text.isEmpty() ? "Nemotron no detectó voz."
-                        : "Transcripción guardada.", false));
+                long totalMs = SystemClock.elapsedRealtime() - started;
+                android.util.Log.i("TransCrypting", "Nemotron CPU: audio=" + result.audioSeconds()
+                        + "s, load=" + result.modelLoadMs() + "ms, total=" + totalMs + "ms");
+                String timing = String.format(Locale.getDefault(),
+                        "CPU · %.1f s de audio · %.1f s en total (%.1f s de carga)",
+                        result.audioSeconds(), totalMs / 1_000.0, result.modelLoadMs() / 1_000.0);
+                String message = result.text().isEmpty() ? "Nemotron no detectó voz." : "Transcripción guardada.";
+                post(() -> finishOperation(message + "\n" + timing, false));
             } catch (IOException | RuntimeException | LinkageError | OutOfMemoryError error) {
                 android.util.Log.w("TransCrypting", "Local transcription failed", error);
                 post(() -> finishOperation(message(error, "No se pudo transcribir. La grabación sigue guardada."), true));
@@ -314,7 +319,8 @@ public final class MainActivity extends Activity {
             }
         }
         copy.setVisibility(text.isEmpty() ? View.GONE : View.VISIBLE);
-        transcribe.setVisibility(model.installed() && text.isEmpty() ? View.VISIBLE : View.GONE);
+        transcribe.setText(file.isFile() ? "Repetir" : "Transcribir");
+        transcribe.setVisibility(model.installed() ? View.VISIBLE : View.GONE);
         transcript.setText(text.isEmpty()
                 ? (file.isFile() ? "Nemotron no detectó voz en este audio." : "Transcripción pendiente.")
                 : text);
