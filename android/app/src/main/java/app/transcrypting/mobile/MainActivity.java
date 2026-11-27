@@ -31,6 +31,7 @@ import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup.LayoutParams;
+import android.view.ViewTreeObserver;
 import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
@@ -40,6 +41,7 @@ import android.window.OnBackInvokedDispatcher;
 import android.widget.Button;
 import android.widget.Chronometer;
 import android.widget.EditText;
+import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
@@ -50,6 +52,7 @@ import android.widget.Toast;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
@@ -65,6 +68,13 @@ import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+
+import io.noties.markwon.AbstractMarkwonPlugin;
+import io.noties.markwon.LinkResolverDef;
+import io.noties.markwon.Markwon;
+import io.noties.markwon.MarkwonConfiguration;
+import io.noties.markwon.core.MarkwonTheme;
+import io.noties.markwon.ext.tables.TablePlugin;
 
 public final class MainActivity extends Activity {
     private static final int MIC_PERMISSION = 1;
@@ -82,24 +92,31 @@ public final class MainActivity extends Activity {
     private static final DateTimeFormatter MONTH = DateTimeFormatter.ofPattern("MMMM yyyy", SPANISH);
 
     private enum State { IDLE, DOWNLOADING, RECORDING, SAVING, IMPORTING, TRANSCRIBING }
-    private enum Page { LIBRARY, CAPTURE, RECORDING, CHAT, RESOURCES }
+    private enum Page { LIBRARY, CAPTURE, RECORDING, RESOURCES }
+    private enum RecordingTab { AUDIO, TRANSCRIPT, CHAT }
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final ExecutorService chatWorker = Executors.newSingleThreadExecutor();
+    private final ExecutorService waveformWorker = Executors.newSingleThreadExecutor();
     private final List<DeepSeek.Turn> chatHistory = new ArrayList<>();
+    private final Button[] tabs = new Button[RecordingTab.values().length];
     private int accentIndex;
     private int accent;
     private State state = State.IDLE;
     private Page page = Page.LIBRARY;
     private Page resourcesParent = Page.LIBRARY;
+    private RecordingTab recordingTab = RecordingTab.TRANSCRIPT;
     private OnBackInvokedCallback backCallback;
     private int libraryScroll;
     private int recordingScroll;
     private int chatRequest;
     private boolean asking;
+    private boolean chatScrollPending;
+    private Markwon markdown;
     private Nemotron model;
     private File recordings;
     private File selected;
+    private File waveformSource;
     private WavRecorder recorder;
     private long captureElapsed;
     private boolean captureReady;
@@ -113,6 +130,9 @@ public final class MainActivity extends Activity {
     private LinearLayout libraryPage;
     private LinearLayout capturePage;
     private LinearLayout recordingPage;
+    private LinearLayout recordingTabs;
+    private LinearLayout audioPage;
+    private LinearLayout transcriptPage;
     private LinearLayout resourcesPage;
     private LinearLayout chatPage;
     private LinearLayout libraryControls;
@@ -135,28 +155,30 @@ public final class MainActivity extends Activity {
     private TextView microphoneStatus;
     private TextView transcriptionStatus;
     private TextView keyStatus;
-    private TextView chatSource;
+    private TextView chatIntro;
+    private TextView audioStatus;
     private TextView chatStatus;
     private TextView transcript;
     private TextView playbackTime;
+    private ProgressBar importProgress;
     private ProgressBar downloadProgress;
     private ProgressBar transcriptionProgress;
     private SeekBar timeline;
     private Chronometer timer;
     private MicrophoneLevels microphoneLevels;
+    private AudioWaveform waveform;
     private Button download;
     private Button record;
     private Button pauseCapture;
     private Button saveCapture;
     private Button importAudio;
-    private Button play;
+    private ImageButton play;
     private Button skipBack;
     private Button skipForward;
     private Button transcribe;
     private Button copy;
     private Button getModel;
-    private Button ask;
-    private Button send;
+    private ImageButton send;
 
     @Override
     public void onCreate(Bundle saved) {
@@ -174,6 +196,8 @@ public final class MainActivity extends Activity {
                 if (file.getName().equals(lastSelection)) selected = file;
             }
             recordingScroll = saved.getInt("recordingScroll");
+            recordingTab = RecordingTab.valueOf(saved.getString("recordingTab", "CHAT".equals(saved.getString("page"))
+                    ? RecordingTab.CHAT.name() : RecordingTab.TRANSCRIPT.name()));
             librarySearch.setText(saved.getString("librarySearch", ""));
             libraryScroll = saved.getInt("libraryScroll");
             resourcesParent = selected != null && saved.getBoolean("resourcesFromRecording")
@@ -185,7 +209,7 @@ public final class MainActivity extends Activity {
         String lastPage = saved == null ? "" : saved.getString("page", "");
         showPage(Page.RESOURCES.name().equals(lastPage) ? Page.RESOURCES
                 : selected != null && (Page.RECORDING.name().equals(lastPage)
-                        || Page.CHAT.name().equals(lastPage)) ? Page.RECORDING : Page.LIBRARY);
+                        || "CHAT".equals(lastPage)) ? Page.RECORDING : Page.LIBRARY);
         if (saved == null) handleSharedAudio(getIntent());
     }
 
@@ -239,7 +263,7 @@ public final class MainActivity extends Activity {
         delete.setOnClickListener(view -> confirmDeleteRecording());
         header.addView(delete, new LinearLayout.LayoutParams(dp(48), dp(48)));
         chatSettings = button("Clave", false);
-        chatSettings.setOnClickListener(view -> openResources());
+        chatSettings.setOnClickListener(view -> editDeepSeekKey());
         header.addView(chatSettings);
 
         librarySearch = field("Buscar por fecha o estado", InputType.TYPE_CLASS_TEXT);
@@ -257,6 +281,22 @@ public final class MainActivity extends Activity {
             @Override public void afterTextChanged(Editable text) {}
         });
 
+        recordingTabs = new LinearLayout(this);
+        recordingTabs.setBackground(rounded(SURFACE, 16));
+        recordingTabs.setPadding(dp(3), dp(3), dp(3), dp(3));
+        root.addView(recordingTabs, spaced(10));
+        String[] tabNames = {"Audio", "Transcripción", "Chat"};
+        for (RecordingTab tab : RecordingTab.values()) {
+            Button item = button(tabNames[tab.ordinal()], false);
+            item.setPadding(0, 0, 0, 0);
+            item.setSingleLine(true);
+            item.setOnClickListener(view -> selectRecordingTab(tab));
+            LinearLayout.LayoutParams tabLayout = new LinearLayout.LayoutParams(0, dp(48), 1);
+            tabLayout.setMargins(dp(2), 0, dp(2), 0);
+            recordingTabs.addView(item, tabLayout);
+            tabs[tab.ordinal()] = item;
+        }
+
         screen = new ScrollView(this);
         screen.setFillViewport(true);
         screen.setClipToPadding(false);
@@ -267,11 +307,15 @@ public final class MainActivity extends Activity {
         libraryPage = column();
         capturePage = column();
         recordingPage = column();
+        audioPage = column();
+        transcriptPage = column();
         resourcesPage = column();
         chatPage = column();
+        recordingPage.addView(audioPage);
+        recordingPage.addView(transcriptPage);
+        recordingPage.addView(chatPage);
         content.addView(libraryPage);
         content.addView(recordingPage);
-        content.addView(chatPage);
         content.addView(resourcesPage);
         capturePage.setPadding(0, dp(18), 0, dp(16));
         root.addView(capturePage, new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, 0, 1));
@@ -294,6 +338,10 @@ public final class MainActivity extends Activity {
     private void createLibraryPage() {
         captureStatus = statusLabel();
         libraryControls.addView(captureStatus);
+        importProgress = progressBar();
+        importProgress.setIndeterminateTintList(ColorStateList.valueOf(accent));
+        importProgress.setContentDescription("Progreso de importación");
+        libraryControls.addView(importProgress);
         record = button("Grabar con micrófono", true);
         setIcon(record, R.drawable.ic_mic, BACKGROUND);
         record.setMinimumHeight(dp(56));
@@ -338,6 +386,14 @@ public final class MainActivity extends Activity {
     }
 
     private void createRecordingPage() {
+        LinearLayout audio = card();
+        audio.addView(label("Forma de onda", 16, INK, true));
+        waveform = new AudioWaveform();
+        audio.addView(waveform, new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, dp(220)));
+        audioStatus = statusLabel();
+        audio.addView(audioStatus);
+        audioPage.addView(audio);
+
         timeline = new SeekBar(this);
         timeline.setContentDescription("Posición del audio");
         timeline.setProgressTintList(ColorStateList.valueOf(accent));
@@ -363,32 +419,30 @@ public final class MainActivity extends Activity {
         recordingControls.addView(timeline, new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, dp(40)));
         playbackTime = label("", 14, MUTED, false);
         playbackTime.setTypeface(Typeface.MONOSPACE);
+        playbackTime.setGravity(Gravity.CENTER);
         recordingControls.addView(playbackTime);
         LinearLayout transport = new LinearLayout(this);
+        transport.setGravity(Gravity.CENTER_VERTICAL);
         skipBack = button("−5 s", false);
         skipBack.setContentDescription("Retroceder 5 segundos");
         skipBack.setOnClickListener(view -> seekBy(-5000));
-        transport.addView(skipBack);
-        play = button("Escuchar", true);
-        setIcon(play, R.drawable.ic_play, BACKGROUND);
+        transport.addView(skipBack, new LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1));
+        play = primaryIconButton(R.drawable.ic_play, "Reproducir", 14);
+        setPlaying(false);
         play.setOnClickListener(view -> togglePlayback());
-        LinearLayout.LayoutParams playLayout = new LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1);
+        LinearLayout.LayoutParams playLayout = new LinearLayout.LayoutParams(dp(72), dp(48));
         playLayout.setMarginStart(dp(8));
         playLayout.setMarginEnd(dp(8));
         transport.addView(play, playLayout);
         skipForward = button("+10 s", false);
         skipForward.setContentDescription("Avanzar 10 segundos");
         skipForward.setOnClickListener(view -> seekBy(10000));
-        transport.addView(skipForward);
+        transport.addView(skipForward, new LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1));
         recordingControls.addView(transport, spaced(8));
-
         LinearLayout reading = card();
-        recordingPage.addView(reading);
+        transcriptPage.addView(reading);
         LinearLayout transcriptHeader = new LinearLayout(this);
-        transcriptHeader.setGravity(Gravity.CENTER_VERTICAL);
-        TextView title = label("Transcripción", 20, INK, true);
-        if (Build.VERSION.SDK_INT >= 28) title.setAccessibilityHeading(true);
-        transcriptHeader.addView(title, new LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1));
+        transcriptHeader.setGravity(Gravity.END);
         copy = button("Copiar", false);
         copy.setOnClickListener(view -> {
             ClipboardManager clipboard = getSystemService(ClipboardManager.class);
@@ -399,13 +453,6 @@ public final class MainActivity extends Activity {
         });
         transcriptHeader.addView(copy);
         reading.addView(transcriptHeader);
-        ask = button("Preguntar a DeepSeek", false);
-        setIcon(ask, R.drawable.ic_message_circle, accent);
-        ask.setOnClickListener(view -> {
-            chatSource.setText(recordingName(selected));
-            showPage(Page.CHAT);
-        });
-        reading.addView(ask, spaced(8));
         transcriptionStatus = statusLabel();
         reading.addView(transcriptionStatus, spaced(8));
         transcriptionProgress = progressBar();
@@ -416,11 +463,11 @@ public final class MainActivity extends Activity {
         reading.addView(transcript, spaced(12));
         transcribe = button("Transcribir", false);
         transcribe.setOnClickListener(view -> transcribeSelected());
-        recordingPage.addView(transcribe, spaced(18));
+        transcriptPage.addView(transcribe, spaced(18));
         getModel = button("Ir a Recursos", false);
         setIcon(getModel, R.drawable.ic_settings, INK);
         getModel.setOnClickListener(view -> openResources());
-        recordingPage.addView(getModel, spaced(16));
+        transcriptPage.addView(getModel, spaced(16));
     }
 
     private void createResourcesPage() {
@@ -451,20 +498,21 @@ public final class MainActivity extends Activity {
     }
 
     private void createChatPage() {
-        LinearLayout source = card();
-        chatPage.addView(source);
-        chatSource = label("", 18, INK, true);
-        source.addView(chatSource);
-        source.addView(label("Al preguntar, se envían a DeepSeek la transcripción de esta grabación y los mensajes de este chat.",
-                14, MUTED, false), spaced(4));
+        chatIntro = label("Al preguntar, DeepSeek Flash recibe esta transcripción y los mensajes del chat.",
+                14, MUTED, false);
+        chatIntro.setPadding(dp(4), 0, dp(4), dp(4));
+        chatPage.addView(chatIntro);
         chatMessages = column();
         chatPage.addView(chatMessages);
         chatStatus = statusLabel();
         chatPage.addView(chatStatus, spaced(12));
 
         chatControls.setGravity(Gravity.CENTER_VERTICAL);
-        questionInput = field("Pregunta sobre esta grabación",
+        chatControls.setBackground(rounded(SURFACE, 25));
+        chatControls.setPadding(dp(5), dp(2), dp(4), dp(2));
+        questionInput = field("Pregunta sobre este audio",
                 InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        questionInput.setBackgroundColor(Color.TRANSPARENT);
         questionInput.setSingleLine(true);
         questionInput.setImeOptions(EditorInfo.IME_ACTION_SEND | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
         questionInput.setOnEditorActionListener((view, action, event) -> {
@@ -473,10 +521,9 @@ public final class MainActivity extends Activity {
             return true;
         });
         chatControls.addView(questionInput, new LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1));
-        send = button("Enviar", true);
+        send = primaryIconButton(R.drawable.ic_arrow_up, "Enviar", 24);
         send.setOnClickListener(view -> askQuestion());
-        LinearLayout.LayoutParams sendLayout =
-                new LinearLayout.LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT);
+        LinearLayout.LayoutParams sendLayout = new LinearLayout.LayoutParams(dp(48), dp(48));
         sendLayout.setMarginStart(dp(8));
         chatControls.addView(send, sendLayout);
     }
@@ -528,41 +575,50 @@ public final class MainActivity extends Activity {
     }
 
     private void askQuestion() {
-        if (page != Page.CHAT || asking || ask.getVisibility() != View.VISIBLE) return;
+        if (!isChatVisible() || asking || copy.getVisibility() != View.VISIBLE) return;
         String question = questionInput.getText().toString().trim();
         if (question.isEmpty()) return;
         String text = transcript.getText().toString();
         List<DeepSeek.Turn> history = new ArrayList<>(chatHistory);
         int request = ++chatRequest;
         asking = true;
-        setEnabled(send, false);
+        renderChatControls();
         questionInput.setText("");
         hideKeyboard(questionInput);
-        LinearLayout pending = addChatMessage("Tú", question);
+        TextView pending = addChatMessage("Tú", question);
+        TextView response = addChatMessage("DeepSeek Flash", "");
+        ((View) response.getParent()).setVisibility(View.GONE);
         setStatus(chatStatus, "Consultando a DeepSeek Flash…", false);
         scrollChatToEnd();
         chatWorker.execute(() -> {
             try {
                 String key = DeepSeek.readKey(this);
-                String answer = DeepSeek.ask(key, text, history, question);
+                String answer = DeepSeek.ask(key, text, history, question, partial -> post(() -> {
+                    if (request != chatRequest) return;
+                    if (chatStatus.getVisibility() == View.VISIBLE) setStatus(chatStatus, "", false);
+                    renderAnswer(response, partial);
+                }));
                 post(() -> {
                     if (request != chatRequest) return;
                     chatHistory.add(new DeepSeek.Turn(question, answer));
-                    addChatMessage("DeepSeek Flash", answer);
+                    renderAnswer(response, answer);
                     finishQuestion("");
                 });
             } catch (IOException error) {
                 post(() -> {
                     if (request != chatRequest) return;
-                    chatMessages.removeView(pending);
-                    if (questionInput.getText().length() == 0) questionInput.setText(question);
+                    if (response.length() == 0) {
+                        chatMessages.removeView((View) pending.getParent());
+                        chatMessages.removeView((View) response.getParent());
+                        questionInput.setText(question);
+                    }
                     finishQuestion(error.getMessage());
                 });
             }
         });
     }
 
-    private LinearLayout addChatMessage(String author, String text) {
+    private TextView addChatMessage(String author, String text) {
         LinearLayout message = card();
         message.addView(label(author, 14, accent, true));
         TextView content = label(text, 16, INK, false);
@@ -570,20 +626,67 @@ public final class MainActivity extends Activity {
         content.setLineSpacing(dp(3), 1f);
         message.addView(content, spaced(4));
         chatMessages.addView(message, spaced(12));
-        return message;
+        return content;
+    }
+
+    private void renderAnswer(TextView response, String text) {
+        boolean follow = !screen.canScrollVertically(1);
+        if (markdown == null) {
+            markdown = Markwon.builder(this)
+                    .usePlugin(new AbstractMarkwonPlugin() {
+                        @Override
+                        public void configureConfiguration(MarkwonConfiguration.Builder builder) {
+                            LinkResolverDef webLinks = new LinkResolverDef();
+                            builder.linkResolver((view, link) -> {
+                                Uri uri = Uri.parse(link);
+                                if ("https".equalsIgnoreCase(uri.getScheme()) && uri.getHost() != null) {
+                                    webLinks.resolve(view, link);
+                                }
+                            });
+                        }
+
+                        @Override
+                        public void configureTheme(MarkwonTheme.Builder builder) {
+                            builder.linkColor(accent).codeBackgroundColor(CONTROL).codeBlockBackgroundColor(CONTROL);
+                        }
+                    })
+                    .usePlugin(TablePlugin.create(this))
+                    .build();
+        }
+        ((View) response.getParent()).setVisibility(View.VISIBLE);
+        markdown.setMarkdown(response, text);
+        if (follow) scrollChatToEnd();
+    }
+
+    private void renderChatControls() {
+        boolean hasTranscript = copy.getVisibility() == View.VISIBLE;
+        chatIntro.setText(hasTranscript
+                ? "Al preguntar, DeepSeek Flash recibe esta transcripción y los mensajes del chat."
+                : "El chat estará disponible cuando esta grabación tenga una transcripción.");
+        setEnabled(questionInput, hasTranscript && !asking);
+        setEnabled(send, hasTranscript && !asking);
     }
 
     private void finishQuestion(String error) {
         asking = false;
-        setEnabled(send, true);
+        renderChatControls();
         setStatus(chatStatus, error, !error.isEmpty());
-        scrollChatToEnd();
+        if (!error.isEmpty()) scrollChatToEnd();
     }
 
     private void scrollChatToEnd() {
-        screen.post(() -> {
-            if (page == Page.CHAT) screen.scrollTo(0, screen.getChildAt(0).getHeight());
+        if (!isChatVisible() || chatScrollPending) return;
+        chatScrollPending = true;
+        screen.getViewTreeObserver().addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {
+            @Override
+            public boolean onPreDraw() {
+                screen.getViewTreeObserver().removeOnPreDrawListener(this);
+                chatScrollPending = false;
+                if (isChatVisible()) screen.scrollTo(0, screen.getChildAt(0).getHeight());
+                return true;
+            }
         });
+        screen.invalidate();
     }
 
     private void clearChat() {
@@ -606,10 +709,10 @@ public final class MainActivity extends Activity {
             hideKeyboard(librarySearch);
         }
         if (page == Page.RECORDING && destination != page) {
-            recordingScroll = screen.getScrollY();
+            if (recordingTab == RecordingTab.TRANSCRIPT) recordingScroll = screen.getScrollY();
+            if (isChatVisible()) hideKeyboard(questionInput);
             stopPlayback();
         }
-        if (page == Page.CHAT && destination != page) hideKeyboard(questionInput);
         page = destination;
         libraryPage.setVisibility(page == Page.LIBRARY ? View.VISIBLE : View.GONE);
         librarySearch.setVisibility(page == Page.LIBRARY ? View.VISIBLE : View.GONE);
@@ -618,20 +721,15 @@ public final class MainActivity extends Activity {
         capturePage.setVisibility(page == Page.CAPTURE ? View.VISIBLE : View.GONE);
         captureControls.setVisibility(page == Page.CAPTURE ? View.VISIBLE : View.GONE);
         recordingPage.setVisibility(page == Page.RECORDING ? View.VISIBLE : View.GONE);
-        recordingControls.setVisibility(page == Page.RECORDING ? View.VISIBLE : View.GONE);
         resourcesPage.setVisibility(page == Page.RESOURCES ? View.VISIBLE : View.GONE);
-        chatPage.setVisibility(page == Page.CHAT ? View.VISIBLE : View.GONE);
-        chatControls.setVisibility(page == Page.CHAT ? View.VISIBLE : View.GONE);
         back.setVisibility(page == Page.LIBRARY ? View.GONE : View.VISIBLE);
         resources.setVisibility(page == Page.LIBRARY ? View.VISIBLE : View.GONE);
         theme.setVisibility(page == Page.LIBRARY ? View.VISIBLE : View.GONE);
-        delete.setVisibility(page == Page.RECORDING ? View.VISIBLE : View.GONE);
-        chatSettings.setVisibility(page == Page.CHAT ? View.VISIBLE : View.GONE);
+        showRecordingTab();
         headerTitle.setText(switch (page) {
             case LIBRARY -> "TransCrypting";
             case CAPTURE -> "Nueva grabación";
             case RECORDING -> recordingName(selected);
-            case CHAT -> "DeepSeek Flash";
             case RESOURCES -> "Recursos";
         });
         if (Build.VERSION.SDK_INT >= 33) {
@@ -647,12 +745,51 @@ public final class MainActivity extends Activity {
         renderState();
         if (page == Page.RESOURCES) refreshDeepSeekKey();
         screen.scrollTo(0, 0);
-        if (page == Page.CHAT) scrollChatToEnd();
         screen.post(() -> {
             if (page != destination) return;
             if (page == Page.LIBRARY) screen.scrollTo(0, libraryScroll);
-            if (page == Page.RECORDING) screen.scrollTo(0, recordingScroll);
+            if (page == Page.RECORDING && recordingTab == RecordingTab.TRANSCRIPT) {
+                screen.scrollTo(0, recordingScroll);
+            }
         });
+    }
+
+    private boolean isChatVisible() {
+        return page == Page.RECORDING && recordingTab == RecordingTab.CHAT;
+    }
+
+    private void selectRecordingTab(RecordingTab tab) {
+        if (recordingTab == tab) return;
+        if (recordingTab == RecordingTab.TRANSCRIPT) recordingScroll = screen.getScrollY();
+        if (isChatVisible()) hideKeyboard(questionInput);
+        recordingTab = tab;
+        screen.scrollTo(0, 0);
+        showRecordingTab();
+        if (tab == RecordingTab.TRANSCRIPT) screen.post(() -> {
+            if (page == Page.RECORDING && recordingTab == tab) screen.scrollTo(0, recordingScroll);
+        });
+    }
+
+    private void showRecordingTab() {
+        boolean recording = page == Page.RECORDING;
+        boolean showingAudio = recording && recordingTab == RecordingTab.AUDIO;
+        boolean showingChat = isChatVisible();
+        recordingTabs.setVisibility(recording ? View.VISIBLE : View.GONE);
+        audioPage.setVisibility(showingAudio ? View.VISIBLE : View.GONE);
+        transcriptPage.setVisibility(recording && recordingTab == RecordingTab.TRANSCRIPT ? View.VISIBLE : View.GONE);
+        chatPage.setVisibility(showingChat ? View.VISIBLE : View.GONE);
+        recordingControls.setVisibility(recording && !showingChat ? View.VISIBLE : View.GONE);
+        chatControls.setVisibility(showingChat ? View.VISIBLE : View.GONE);
+        delete.setVisibility(recording && !showingChat ? View.VISIBLE : View.GONE);
+        chatSettings.setVisibility(showingChat ? View.VISIBLE : View.GONE);
+        for (Button tab : tabs) {
+            boolean active = tab == tabs[recordingTab.ordinal()];
+            tab.setSelected(active);
+            tab.setTextColor(active ? BACKGROUND : MUTED);
+            tab.setBackground(interactiveBackground(active ? accent : SURFACE, 13));
+        }
+        if (showingAudio) loadWaveform();
+        if (showingChat) scrollChatToEnd();
     }
 
     private void openResources() {
@@ -688,7 +825,6 @@ public final class MainActivity extends Activity {
         }
         showPage(switch (page) {
             case RESOURCES -> resourcesParent;
-            case CHAT -> Page.RECORDING;
             default -> Page.LIBRARY;
         });
     }
@@ -743,16 +879,23 @@ public final class MainActivity extends Activity {
         }
         state = State.IMPORTING;
         setStatus(captureStatus, "Importando audio…", false);
+        importProgress.setIndeterminate(true);
         showPage(Page.LIBRARY);
         worker.execute(() -> {
+            long started = SystemClock.elapsedRealtime();
             try {
                 Files.createDirectories(recordings.toPath());
                 String name = importedAudioName(uri);
                 File wav = new File(recordings, System.currentTimeMillis() + "-" + name + ".wav");
-                AudioImport.convert(this, uri, wav);
+                AudioImport.convert(this, uri, wav, percent -> post(() -> {
+                    importProgress.setIndeterminate(false);
+                    showProgress("Importando audio", percent);
+                }));
+                long totalMs = SystemClock.elapsedRealtime() - started;
+                android.util.Log.i("TransCrypting", "Audio import: total=" + totalMs + "ms");
                 post(() -> {
                     finishOperation("", false);
-                    librarySearch.setText("");
+                    if (librarySearch.length() > 0) librarySearch.setText("");
                     openRecording(wav);
                     if (model.installed()) transcribeSelected();
                 });
@@ -1017,6 +1160,7 @@ public final class MainActivity extends Activity {
             stopPlayback();
             selected = wav;
             recordingScroll = 0;
+            recordingTab = RecordingTab.TRANSCRIPT;
             clearChat();
             setStatus(transcriptionStatus, "", false);
         }
@@ -1074,7 +1218,6 @@ public final class MainActivity extends Activity {
         }
         boolean installed = model.installed();
         copy.setVisibility(text.isEmpty() ? View.GONE : View.VISIBLE);
-        ask.setVisibility(text.isEmpty() ? View.GONE : View.VISIBLE);
         transcribe.setText(file.isFile() ? "Repetir" : "Transcribir");
         transcribe.setVisibility(installed ? View.VISIBLE : View.GONE);
         getModel.setVisibility(!installed && !file.isFile() ? View.VISIBLE : View.GONE);
@@ -1082,11 +1225,13 @@ public final class MainActivity extends Activity {
                 : installed ? "Transcripción pendiente." : "Descarga Nemotron para transcribir este audio.";
         transcript.setText(text.isEmpty() && !unreadable ? emptyText : text);
         transcript.setVisibility(unreadable ? View.GONE : View.VISIBLE);
+        renderChatControls();
     }
 
     private void renderState() {
         boolean idle = state == State.IDLE;
         boolean recording = state == State.RECORDING;
+        boolean playbackAvailable = idle || state == State.TRANSCRIBING;
         setEnabled(record, idle);
         setEnabled(importAudio, idle);
         setEnabled(theme, idle);
@@ -1097,23 +1242,27 @@ public final class MainActivity extends Activity {
         setEnabled(resources, state != State.RECORDING && state != State.SAVING);
         setEnabled(delete, idle);
         setEnabled(download, idle);
-        setEnabled(play, idle);
-        setEnabled(skipBack, idle);
-        setEnabled(skipForward, idle);
-        setEnabled(ask, idle);
-        timeline.setEnabled(idle);
+        setEnabled(play, playbackAvailable);
+        setEnabled(skipBack, playbackAvailable);
+        setEnabled(skipForward, playbackAvailable);
+        timeline.setEnabled(playbackAvailable);
         setEnabled(transcribe, idle);
         setEnabled(getModel, idle);
         for (int i = 0; i < recordingList.getChildCount(); i++) {
             View row = recordingList.getChildAt(i);
             if (row.getTag() instanceof File wav) setEnabled(row, canOpenRecording(wav));
         }
+        importProgress.setVisibility(state == State.IMPORTING ? View.VISIBLE : View.GONE);
         downloadProgress.setVisibility(state == State.DOWNLOADING ? View.VISIBLE : View.GONE);
         transcriptionProgress.setVisibility(state == State.TRANSCRIBING ? View.VISIBLE : View.GONE);
     }
 
     private void showProgress(String operation, int value) {
-        ProgressBar progress = state == State.DOWNLOADING ? downloadProgress : transcriptionProgress;
+        ProgressBar progress = switch (state) {
+            case IMPORTING -> importProgress;
+            case DOWNLOADING -> downloadProgress;
+            default -> transcriptionProgress;
+        };
         progress.setProgress(value);
         setStatus(operationStatus(), operation + " · " + value + "%", false);
     }
@@ -1201,7 +1350,7 @@ public final class MainActivity extends Activity {
             player.setOnCompletionListener(ignored -> stopPlayback());
             player.setOnErrorListener((ignored, what, extra) -> {
                 stopPlayback();
-                setStatus(transcriptionStatus, "No se pudo reproducir el audio.", true);
+                showPlaybackError();
                 return true;
             });
             player.setOnPreparedListener(prepared -> {
@@ -1217,8 +1366,14 @@ public final class MainActivity extends Activity {
             player.prepareAsync();
         } catch (IOException | IllegalStateException error) {
             stopPlayback();
-            setStatus(transcriptionStatus, "No se pudo reproducir el audio.", true);
+            showPlaybackError();
         }
+    }
+
+    private void showPlaybackError() {
+        String error = "No se pudo reproducir el audio.";
+        setStatus(transcriptionStatus, error, true);
+        setStatus(audioStatus, error, true);
     }
 
     private void updatePlayback() {
@@ -1242,11 +1397,12 @@ public final class MainActivity extends Activity {
         String time = getString(R.string.playback_time,
                 formatTime(timeline.getProgress()), formatTime(timeline.getMax()));
         if (!time.contentEquals(playbackTime.getText())) playbackTime.setText(time);
+        if (waveform.getVisibility() == View.VISIBLE) waveform.invalidate();
     }
 
     private void setPlaying(boolean playing) {
-        play.setText(playing ? "Pausar" : "Escuchar");
-        setIcon(play, playing ? R.drawable.ic_pause : R.drawable.ic_play, BACKGROUND);
+        play.setImageResource(playing ? R.drawable.ic_pause : R.drawable.ic_play);
+        play.setContentDescription(playing ? "Pausar" : "Reproducir");
     }
 
     private void stopPlayback() {
@@ -1265,9 +1421,11 @@ public final class MainActivity extends Activity {
         super.onSaveInstanceState(state);
         if (selected != null) state.putString("recording", selected.getName());
         state.putString("page", page.name());
-        state.putBoolean("resourcesFromRecording", resourcesParent == Page.RECORDING || resourcesParent == Page.CHAT);
+        state.putString("recordingTab", recordingTab.name());
+        state.putBoolean("resourcesFromRecording", resourcesParent == Page.RECORDING);
         state.putInt("libraryScroll", page == Page.LIBRARY ? screen.getScrollY() : libraryScroll);
-        state.putInt("recordingScroll", page == Page.RECORDING ? screen.getScrollY() : recordingScroll);
+        state.putInt("recordingScroll", page == Page.RECORDING && recordingTab == RecordingTab.TRANSCRIPT
+                ? screen.getScrollY() : recordingScroll);
         state.putString("librarySearch", librarySearch.getText().toString());
     }
 
@@ -1282,6 +1440,7 @@ public final class MainActivity extends Activity {
     protected void onDestroy() {
         worker.shutdownNow();
         chatWorker.shutdownNow();
+        waveformWorker.shutdownNow();
         super.onDestroy();
     }
 
@@ -1318,6 +1477,18 @@ public final class MainActivity extends Activity {
         button.setMinimumHeight(dp(48));
         button.setPaddingRelative(dp(14), dp(8), dp(14), dp(8));
         button.setBackground(interactiveBackground(primary ? accent : CONTROL, 14));
+        return button;
+    }
+
+    private ImageButton primaryIconButton(int resource, String action, int radius) {
+        ImageButton button = new ImageButton(this);
+        button.setBackground(interactiveBackground(accent, radius));
+        button.setImageResource(resource);
+        button.setImageTintList(ColorStateList.valueOf(BACKGROUND));
+        button.setScaleType(ImageView.ScaleType.CENTER);
+        button.setPadding(0, 0, 0, 0);
+        button.setContentDescription(action);
+        button.setFocusable(true);
         return button;
     }
 
@@ -1400,6 +1571,74 @@ public final class MainActivity extends Activity {
 
     private int dp(int units) {
         return Math.round(units * getResources().getDisplayMetrics().density);
+    }
+
+    private void loadWaveform() {
+        waveform.invalidate();
+        File wav = selected;
+        if (wav == null || wav.equals(waveformSource)) return;
+        waveformSource = wav;
+        waveform.peaks = null;
+        setStatus(audioStatus, "Cargando forma de onda…", false);
+        waveformWorker.execute(() -> {
+            try (RandomAccessFile file = new RandomAccessFile(wav, "r")) {
+                int[] peaks = new int[72];
+                long samples = (file.length() - WavRecorder.HEADER_BYTES) / 2;
+                byte[] buffer = new byte[2048];
+                for (int i = 0; i < peaks.length; i++) {
+                    long start = samples * i / peaks.length;
+                    long end = samples * (i + 1) / peaks.length;
+                    int count = (int) Math.min(end - start, buffer.length / 2);
+                    if (count <= 0) continue;
+                    long center = start + (end - start - count) / 2;
+                    file.seek(WavRecorder.HEADER_BYTES + center * 2);
+                    file.readFully(buffer, 0, count * 2);
+                    for (int offset = 0; offset < count * 2; offset += 2) {
+                        int sample = (buffer[offset] & 0xff) | (buffer[offset + 1] << 8);
+                        peaks[i] = Math.max(peaks[i], Math.abs(sample));
+                    }
+                }
+                post(() -> {
+                    if (!wav.equals(waveformSource)) return;
+                    waveform.peaks = peaks;
+                    waveform.invalidate();
+                    setStatus(audioStatus, "", false);
+                });
+            } catch (IOException error) {
+                post(() -> {
+                    if (!wav.equals(waveformSource)) return;
+                    waveformSource = null;
+                    setStatus(audioStatus, "No se pudo leer la forma de onda.", true);
+                });
+            }
+        });
+    }
+
+    private final class AudioWaveform extends View {
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private int[] peaks;
+
+        AudioWaveform() {
+            super(MainActivity.this);
+            setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            if (peaks == null) return;
+            float step = (float) getWidth() / peaks.length;
+            float center = getHeight() / 2f;
+            float radius = step * 0.29f;
+            float progress = (float) timeline.getProgress() / Math.max(1, timeline.getMax());
+            for (int i = 0; i < peaks.length; i++) {
+                float x = (i + 0.5f) * step;
+                float height = Math.max(radius, (float) Math.sqrt(peaks[i] / 32768.0) * center * 0.82f);
+                paint.setColor(i < progress * peaks.length ? accent : MUTED);
+                paint.setAlpha(peaks[i] == 0 ? 105 : 255);
+                canvas.drawRoundRect(x - radius, center - height, x + radius, center + height,
+                        radius, radius, paint);
+            }
+        }
     }
 
     private final class MicrophoneLevels extends View {

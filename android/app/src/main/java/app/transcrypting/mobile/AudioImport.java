@@ -24,6 +24,7 @@ import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.function.IntConsumer;
 
 final class AudioImport {
     private static final int RATE = WavRecorder.SAMPLE_RATE;
@@ -31,7 +32,7 @@ final class AudioImport {
 
     private AudioImport() {}
 
-    static void convert(Context context, Uri uri, File destination) throws IOException {
+    static void convert(Context context, Uri uri, File destination, IntConsumer progress) throws IOException {
         checkInterrupted();
         if (!ContentResolver.SCHEME_CONTENT.equals(uri.getScheme())) {
             throw new IOException("Selecciona el archivo desde el selector o compártelo desde una app.");
@@ -64,7 +65,9 @@ final class AudioImport {
             temporary = Files.createTempFile(directory, "import-audio-", ".part");
             try (RandomAccessFile output = new RandomAccessFile(temporary.toFile(), "rw")) {
                 output.seek(WavRecorder.HEADER_BYTES);
-                PcmWriter writer = new PcmWriter(output);
+                long durationUs = format.containsKey(MediaFormat.KEY_DURATION)
+                        ? format.getLong(MediaFormat.KEY_DURATION) : 0;
+                PcmWriter writer = new PcmWriter(output, durationUs, progress);
                 String mime = format.getString(MediaFormat.KEY_MIME);
                 if ("audio/raw".equals(mime)) {
                     writeRaw(extractor, format, writer);
@@ -218,6 +221,8 @@ final class AudioImport {
 
     private static final class PcmWriter {
         private final RandomAccessFile output;
+        private final long durationUs;
+        private final IntConsumer progress;
         private final ByteBuffer wav = ByteBuffer.allocate(16 * 1024).order(ByteOrder.LITTLE_ENDIAN);
         private int sampleRate;
         private int channels;
@@ -226,9 +231,13 @@ final class AudioImport {
         private int ticks;
         private long weightedSample;
         private long pcmBytes;
+        private int lastPercent;
 
-        PcmWriter(RandomAccessFile output) {
+        PcmWriter(RandomAccessFile output, long durationUs, IntConsumer progress) {
             this.output = output;
+            this.durationUs = durationUs;
+            this.progress = progress;
+            if (durationUs > 0) progress.accept(0);
         }
 
         void setFormat(MediaFormat format) throws IOException {
@@ -282,6 +291,14 @@ final class AudioImport {
                     ticks += weight;
                     remaining -= weight;
                     if (ticks == sampleRate) writePartialSample();
+                }
+            }
+            if (durationUs > 0) {
+                long writtenUs = (pcmBytes + wav.position()) * 1_000_000L / (RATE * 2);
+                int percent = 5 * (int) Math.min(19, 20 * writtenUs / durationUs);
+                if (percent > lastPercent) {
+                    lastPercent = percent;
+                    progress.accept(percent);
                 }
             }
         }

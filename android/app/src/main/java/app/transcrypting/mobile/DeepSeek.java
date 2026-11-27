@@ -10,6 +10,7 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
@@ -20,6 +21,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.util.List;
+import java.util.function.Consumer;
 
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
@@ -45,7 +47,7 @@ final class DeepSeek {
 
     private DeepSeek() {}
 
-    static String ask(String apiKey, String transcript, List<Turn> history, String question)
+    static String ask(String apiKey, String transcript, List<Turn> history, String question, Consumer<String> onUpdate)
             throws IOException {
         String key = normalizeKey(apiKey);
         if (key.isEmpty()) throw new IOException("Agrega tu clave de DeepSeek.");
@@ -67,6 +69,7 @@ final class DeepSeek {
             byte[] request = new JSONObject()
                     .put("model", MODEL)
                     .put("thinking", new JSONObject().put("type", "disabled"))
+                    .put("stream", true)
                     .put("messages", messages)
                     .toString().getBytes(StandardCharsets.UTF_8);
 
@@ -79,13 +82,18 @@ final class DeepSeek {
             connection.setFixedLengthStreamingMode(request.length);
             connection.setRequestProperty("Authorization", "Bearer " + key);
             connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-            connection.setRequestProperty("Accept", "application/json");
+            connection.setRequestProperty("Accept", "text/event-stream");
 
             try (OutputStream output = connection.getOutputStream()) {
                 output.write(request);
             }
             status = connection.getResponseCode();
-            if (status == HttpsURLConnection.HTTP_OK) answer = readAnswer(connection);
+            if (status == HttpsURLConnection.HTTP_OK) {
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                        connection.getInputStream(), StandardCharsets.UTF_8))) {
+                    answer = readAnswer(reader, onUpdate);
+                }
+            }
         } catch (HttpRetryException error) {
             throw new IOException(statusMessage(error.responseCode()));
         } catch (SocketTimeoutException error) {
@@ -109,22 +117,38 @@ final class DeepSeek {
         return new JSONObject().put("role", role).put("content", content);
     }
 
-    private static String readAnswer(HttpsURLConnection connection) throws IOException, JSONException {
-        StringBuilder response = new StringBuilder();
-        try (InputStreamReader reader = new InputStreamReader(
-                connection.getInputStream(), StandardCharsets.UTF_8)) {
-            char[] buffer = new char[4096];
-            int count;
-            while ((count = reader.read(buffer)) != -1) {
-                if (response.length() + count > 1_048_576) {
+    static String readAnswer(BufferedReader reader, Consumer<String> onUpdate) throws IOException, JSONException {
+        StringBuilder answer = new StringBuilder();
+        long lastUpdate = 0;
+        int reportedLength = 0;
+        try {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (!line.startsWith("data:")) continue;
+                String data = line.substring(5).trim();
+                if ("[DONE]".equals(data)) return answer.toString().trim();
+                if (data.length() > 1_048_576) throw new JSONException("Respuesta demasiado grande");
+                JSONObject event = new JSONObject(data);
+                if (event.has("error")) throw new JSONException("DeepSeek interrumpió la respuesta");
+                JSONArray choices = event.optJSONArray("choices");
+                JSONObject choice = choices == null ? null : choices.optJSONObject(0);
+                JSONObject delta = choice == null ? null : choice.optJSONObject("delta");
+                if (delta == null || !(delta.opt("content") instanceof String text) || text.isEmpty()) continue;
+                if (answer.length() + text.length() > 1_048_576) {
                     throw new JSONException("Respuesta demasiado grande");
                 }
-                response.append(buffer, 0, count);
+                answer.append(text);
+                long now = System.nanoTime();
+                if (reportedLength == 0 || now - lastUpdate >= 65_000_000L) {
+                    onUpdate.accept(answer.toString());
+                    lastUpdate = now;
+                    reportedLength = answer.length();
+                }
             }
+            throw new IOException("Respuesta de DeepSeek incompleta");
+        } finally {
+            if (reportedLength < answer.length()) onUpdate.accept(answer.toString());
         }
-        JSONObject choice = new JSONObject(response.toString()).getJSONArray("choices").getJSONObject(0);
-        Object content = choice.getJSONObject("message").opt("content");
-        return content instanceof String text ? text.trim() : "";
     }
 
     private static String statusMessage(int status) {
