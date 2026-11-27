@@ -585,8 +585,8 @@ public final class MainActivity extends Activity {
         renderChatControls();
         questionInput.setText("");
         hideKeyboard(questionInput);
-        TextView pending = addChatMessage("Tú", question);
-        TextView response = addChatMessage("DeepSeek Flash", "");
+        TextView pending = addChatMessage(question, true);
+        TextView response = addChatMessage("", false);
         ((View) response.getParent()).setVisibility(View.GONE);
         setStatus(chatStatus, "Consultando a DeepSeek Flash…", false);
         scrollChatToEnd();
@@ -618,14 +618,22 @@ public final class MainActivity extends Activity {
         });
     }
 
-    private TextView addChatMessage(String author, String text) {
+    private TextView addChatMessage(String text, boolean fromUser) {
         LinearLayout message = card();
-        message.addView(label(author, 14, accent, true));
-        TextView content = label(text, 16, INK, false);
+        LinearLayout.LayoutParams layout = spaced(12);
+        if (fromUser) {
+            message.setBackground(rounded(accent, 20));
+            layout.width = LayoutParams.WRAP_CONTENT;
+            layout.gravity = Gravity.END;
+            layout.setMarginStart(dp(56));
+        } else {
+            message.addView(label("DeepSeek Flash", 14, accent, true));
+        }
+        TextView content = label(text, 16, fromUser ? Color.BLACK : INK, false);
         content.setTextIsSelectable(true);
         content.setLineSpacing(dp(3), 1f);
-        message.addView(content, spaced(4));
-        chatMessages.addView(message, spaced(12));
+        message.addView(content, spaced(fromUser ? 0 : 4));
+        chatMessages.addView(message, layout);
         return content;
     }
 
