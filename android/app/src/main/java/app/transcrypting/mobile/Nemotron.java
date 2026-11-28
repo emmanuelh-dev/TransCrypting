@@ -55,6 +55,7 @@ final class Nemotron {
     private record Asset(String name, long bytes, String sha256) {}
 
     private final File directory;
+    private volatile OfflineRecognizer recognizer;
 
     Nemotron(File filesDir) {
         directory = new File(filesDir, "nemotron-es-7691099");
@@ -190,7 +191,13 @@ final class Nemotron {
         return true;
     }
 
-    Transcription transcribe(File wav, Progress progress) throws IOException {
+    boolean loaded() {
+        return recognizer != null;
+    }
+
+    long load() {
+        if (loaded()) return 0;
+
         OfflineRecognizerConfig config = new OfflineRecognizerConfig();
         config.getFeatConfig().setFeatureDim(128);
         var model = config.getModelConfig();
@@ -203,8 +210,13 @@ final class Nemotron {
         model.getTransducer().setJoiner(new File(directory, "joiner.onnx").getAbsolutePath());
 
         long loadStarted = SystemClock.elapsedRealtime();
-        OfflineRecognizer recognizer = new OfflineRecognizer(null, config);
-        long modelLoadMs = SystemClock.elapsedRealtime() - loadStarted;
+        recognizer = new OfflineRecognizer(null, config);
+        return SystemClock.elapsedRealtime() - loadStarted;
+    }
+
+    Transcription transcribe(File wav, Progress progress) throws IOException {
+        checkInterrupted();
+        long modelLoadMs = load();
         try (RandomAccessFile audio = new RandomAccessFile(wav, "r")) {
             StringBuilder text = new StringBuilder();
             long totalSamples = (audio.length() - WavRecorder.HEADER_BYTES) / 2;
@@ -237,8 +249,6 @@ final class Nemotron {
                 progress.update((int) (position * 100 / totalSamples));
             }
             return new Transcription(text.toString(), (double) totalSamples / WavRecorder.SAMPLE_RATE, modelLoadMs);
-        } finally {
-            recognizer.release();
         }
     }
 

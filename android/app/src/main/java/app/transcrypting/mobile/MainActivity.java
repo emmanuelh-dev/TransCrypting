@@ -68,6 +68,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import io.noties.markwon.AbstractMarkwonPlugin;
 import io.noties.markwon.LinkResolverDef;
@@ -90,6 +91,8 @@ public final class MainActivity extends Activity {
     private static final Locale SPANISH = Locale.forLanguageTag("es-MX");
     private static final DateTimeFormatter DATE = DateTimeFormatter.ofPattern("d MMM yyyy", SPANISH);
     private static final DateTimeFormatter MONTH = DateTimeFormatter.ofPattern("MMMM yyyy", SPANISH);
+    private static final ExecutorService MODEL_WORKER = Executors.newSingleThreadExecutor();
+    private static Nemotron model;
 
     private enum State { IDLE, DOWNLOADING, RECORDING, SAVING, IMPORTING, TRANSCRIBING }
     private enum Page { LIBRARY, CAPTURE, RECORDING, RESOURCES }
@@ -113,7 +116,8 @@ public final class MainActivity extends Activity {
     private boolean asking;
     private boolean chatScrollPending;
     private Markwon markdown;
-    private Nemotron model;
+    private Future<?> modelOperation;
+    private boolean modelPreloading;
     private File recordings;
     private File selected;
     private File waveformSource;
@@ -185,7 +189,7 @@ public final class MainActivity extends Activity {
         super.onCreate(saved);
         accentIndex = Math.max(0, Math.min(ACCENTS.length - 1, getPreferences(MODE_PRIVATE).getInt("accent", 0)));
         accent = ACCENTS[accentIndex];
-        model = new Nemotron(getFilesDir());
+        if (model == null) model = new Nemotron(getFilesDir());
         recordings = new File(getFilesDir(), "recordings");
         createScreen();
 
@@ -210,6 +214,7 @@ public final class MainActivity extends Activity {
         showPage(Page.RESOURCES.name().equals(lastPage) ? Page.RESOURCES
                 : selected != null && (Page.RECORDING.name().equals(lastPage)
                         || "CHAT".equals(lastPage)) ? Page.RECORDING : Page.LIBRARY);
+        preloadModel();
         if (saved == null) handleSharedAudio(getIntent());
     }
 
@@ -931,17 +936,37 @@ public final class MainActivity extends Activity {
         return "Audio importado";
     }
 
+    private void preloadModel() {
+        if (!model.installed() || model.loaded()) return;
+        modelPreloading = true;
+        refreshModel();
+        MODEL_WORKER.execute(() -> {
+            try {
+                long loadMs = model.load();
+                if (loadMs > 0) android.util.Log.i("TransCrypting", "Nemotron preload: " + loadMs + "ms");
+            } catch (RuntimeException | LinkageError | OutOfMemoryError error) {
+                android.util.Log.w("TransCrypting", "Nemotron preload failed", error);
+            } finally {
+                post(() -> {
+                    modelPreloading = false;
+                    refreshModel();
+                });
+            }
+        });
+    }
+
     private void downloadModel() {
         if (state != State.IDLE) return;
         File pending = resourcesParent == Page.RECORDING ? selected : null;
         state = State.DOWNLOADING;
         renderState();
         showProgress("Descargando modelo", 0);
-        worker.execute(() -> {
+        modelOperation = MODEL_WORKER.submit(() -> {
             try {
                 model.install(percent -> post(() -> showProgress("Descargando modelo", percent)));
                 post(() -> {
-                    finishOperation("Modelo listo para transcribir en el teléfono.", false);
+                    finishOperation("Modelo instalado.", false);
+                    preloadModel();
                     if (pending != null && pending.equals(selected) && !textFile(pending).isFile()) {
                         transcribeSelected();
                     }
@@ -1046,9 +1071,9 @@ public final class MainActivity extends Activity {
         state = State.TRANSCRIBING;
         refreshLibrary();
         renderState();
-        showProgress("Abriendo Nemotron", 0);
-        worker.execute(() -> {
-            long started = SystemClock.elapsedRealtime();
+        showProgress(model.loaded() ? "Transcribiendo en el teléfono" : "Preparando Nemotron", 0);
+        long started = SystemClock.elapsedRealtime();
+        modelOperation = MODEL_WORKER.submit(() -> {
             try {
                 Nemotron.Transcription result = model.transcribe(wav,
                         percent -> post(() -> showProgress("Transcribiendo en el teléfono", percent)));
@@ -1089,11 +1114,15 @@ public final class MainActivity extends Activity {
     }
 
     private void refreshModel() {
-        modelStatus.setText(model.installed()
-                ? "Disponible sin conexión"
-                : "Descarga de 672 MB");
-        modelStatus.setTextColor(model.installed() ? accent : MUTED);
-        download.setVisibility(model.installed() ? View.GONE : View.VISIBLE);
+        boolean installed = model.installed();
+        String status = "Descarga de 672 MB";
+        if (installed) {
+            status = model.loaded() ? "Cargado · listo sin conexión"
+                    : modelPreloading ? "Preparando Nemotron…" : "Instalado · disponible sin conexión";
+        }
+        modelStatus.setText(status);
+        modelStatus.setTextColor(installed ? accent : MUTED);
+        download.setVisibility(installed ? View.GONE : View.VISIBLE);
     }
 
     private void refreshLibrary() {
@@ -1446,6 +1475,7 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        if (modelOperation != null) modelOperation.cancel(true);
         worker.shutdownNow();
         chatWorker.shutdownNow();
         waveformWorker.shutdownNow();

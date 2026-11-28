@@ -12,7 +12,7 @@ Grabadora nativa con transcripción local en español mediante Nemotron Labs Uni
 6. Usa **Importar audio** en la biblioteca o elige **TransCrypting** en el menú **Compartir** de Android. Al terminar la importación puedes escuchar el audio mientras se transcribe.
 7. Para personalizar el color de acento, abre **Tema** desde la biblioteca.
 
-La app guarda el audio WAV y las transcripciones en su almacenamiento privado. Después de descargar el modelo puedes grabar y transcribir sin conexión. Esta versión usa CPU y genera el texto al terminar la grabación.
+La app guarda el audio WAV y las transcripciones en su almacenamiento privado. Después de la descarga inicial, la app carga Nemotron en segundo plano al abrirse y lo reutiliza mientras su proceso siga activo. Puedes grabar y transcribir sin conexión. Esta versión usa CPU y genera el texto al terminar la grabación.
 
 Para hacer preguntas sobre una grabación transcrita, abre **Chat** en el detalle. Puedes guardar tu clave de DeepSeek desde **Clave** o **Recursos**. El chat usa DeepSeek Flash por internet y muestra las respuestas con Markdown conforme llegan. Al enviar una pregunta, se comparte el texto de esa transcripción y el historial del chat con DeepSeek.
 
